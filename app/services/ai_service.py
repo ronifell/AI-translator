@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import OrderedDict
 from threading import Lock
 from typing import Callable
@@ -21,6 +22,10 @@ Rules (strict):
 - Preserve meaning and sacred phrasing exactly.
 - Keep structure, line breaks, and formatting unchanged unless a clear typo requires a minimal fix.
 - If a short passage is clearly in the wrong language for its context, translate it minimally to the target language. Keep such changes under 1% of the total text unless the wrong-language segment is longer.
+- Preserve literal escaped break markers:
+  - Keep `\\n` and `\\n\\n` only.
+  - If there are runs like `\\n\\n\\n` or more, reduce them to `\\n\\n`.
+  - Remove stray backslashes `\\` that are not part of `\\n`.
 
 Return ONLY the corrected text with no quotes, no preamble, and no explanation."""
 
@@ -51,6 +56,14 @@ def _cache_set(key: str, value: str) -> None:
         _cache.move_to_end(key)
         while len(_cache) > settings.ai_cache_size:
             _cache.popitem(last=False)
+
+
+def _normalize_escaped_breaks(text: str) -> str:
+    # Collapse 3+ escaped breaks to exactly two (e.g., \n\n\n -> \n\n)
+    text = re.sub(r"(?:\\n){3,}", r"\\n\\n", text)
+    # Remove stray backslashes not followed by n
+    text = re.sub(r"\\(?!n)", "", text)
+    return text
 
 
 def correct_text(
@@ -95,7 +108,7 @@ Return ONLY the corrected text."""
     out = (resp.choices[0].message.content or "").strip()
     if on_progress:
         on_progress("ai_done")
-    final = out if out else text
+    final = _normalize_escaped_breaks(out if out else text)
     _cache_set(cache_key, final)
     return final
 
@@ -136,6 +149,6 @@ Return ONLY the title line."""
     title = (resp.choices[0].message.content or "").strip().split("\n")[0].strip()
     if on_progress:
         on_progress("ai_title_done")
-    final = title if title else "Untitled"
+    final = _normalize_escaped_breaks(title if title else "Untitled")
     _cache_set(cache_key, final)
     return final
