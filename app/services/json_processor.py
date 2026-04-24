@@ -30,6 +30,16 @@ class ProcessContext:
 
 
 ProgressCb = Callable[[str, str | None], None]
+ShouldCancelCb = Callable[[], bool]
+
+
+class ProcessingCancelledError(RuntimeError):
+    pass
+
+
+def _raise_if_cancelled(should_cancel: ShouldCancelCb | None) -> None:
+    if should_cancel and should_cancel():
+        raise ProcessingCancelledError("Processing cancelled by user")
 
 
 def _path_join(base: str, key: str | int) -> str:
@@ -102,13 +112,16 @@ def _review_body_text(
     options: ProcessOptions,
     ctx: ProcessContext,
     progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
 ) -> str:
+    _raise_if_cancelled(should_cancel)
     cached = ctx.reviewed_text_cache.get(original)
     if cached is not None:
         if progress:
             # Match estimate_progress_units: each chunk slot for this occurrence counts as one unit.
             n = len(_chunk_string(original, settings.max_chunk_chars))
             for j in range(n):
+                _raise_if_cancelled(should_cancel)
                 subpath = f"{path}#part{j}" if n > 1 else path
                 progress("memo_hit", subpath)
         tracker.record(path, original, cached)
@@ -120,6 +133,7 @@ def _review_body_text(
     if use_parallel:
         tasks: list[tuple[int, str, str]] = []
         for i, ch in enumerate(chunks):
+            _raise_if_cancelled(should_cancel)
             subpath = f"{path}#part{i}" if len(chunks) > 1 else path
             if progress:
                 progress("chunk", subpath)
@@ -136,9 +150,11 @@ def _review_body_text(
             ]
             out = [""] * len(chunks)
             for (i, _ch, _subpath), fut in zip(tasks, futures):
+                _raise_if_cancelled(should_cancel)
                 out[i] = fut.result()
     else:
         for i, ch in enumerate(chunks):
+            _raise_if_cancelled(should_cancel)
             subpath = f"{path}#part{i}" if len(chunks) > 1 else path
             if progress:
                 progress("chunk", subpath)
@@ -161,7 +177,9 @@ def _review_or_generate_title(
     options: ProcessOptions,
     ctx: ProcessContext,
     progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
 ) -> None:
+    _raise_if_cancelled(should_cancel)
     raw = item.get("titulo")
     body = item.get("texto") if isinstance(item.get("texto"), str) else ""
 
@@ -184,7 +202,9 @@ def _review_or_generate_title(
         return
 
     if isinstance(raw, str) and raw.strip():
-        item["titulo"] = _review_body_text(raw, titulo_path, tracker, options, ctx, progress)
+        item["titulo"] = _review_body_text(
+            raw, titulo_path, tracker, options, ctx, progress, should_cancel
+        )
 
 
 def _walk_qumran(
@@ -194,7 +214,9 @@ def _walk_qumran(
     options: ProcessOptions,
     ctx: ProcessContext,
     progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
 ) -> Any:
+    _raise_if_cancelled(should_cancel)
     if isinstance(node, dict):
         out: dict[str, Any] = {}
         for k, v in node.items():
@@ -202,17 +224,17 @@ def _walk_qumran(
             if k == "texto_ingles":
                 out[k] = v
             elif isinstance(v, str):
-                out[k] = _review_body_text(v, cp, tracker, options, ctx, progress)
+                out[k] = _review_body_text(v, cp, tracker, options, ctx, progress, should_cancel)
             else:
-                out[k] = _walk_qumran(v, cp, tracker, options, ctx, progress)
+                out[k] = _walk_qumran(v, cp, tracker, options, ctx, progress, should_cancel)
         return out
     if isinstance(node, list):
         return [
-            _walk_qumran(item, _path_join(path, i), tracker, options, ctx, progress)
+            _walk_qumran(item, _path_join(path, i), tracker, options, ctx, progress, should_cancel)
             for i, item in enumerate(node)
         ]
     if isinstance(node, str):
-        return _review_body_text(node, path, tracker, options, ctx, progress)
+        return _review_body_text(node, path, tracker, options, ctx, progress, should_cancel)
     return node
 
 
@@ -224,26 +246,28 @@ def _process_comentarios(
     tracker: DiffTracker,
     ctx: ProcessContext,
     progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
 ) -> None:
     if isinstance(node, list):
         for i, item in enumerate(node):
+            _raise_if_cancelled(should_cancel)
             p = _path_join(path, i)
             if not isinstance(item, dict):
                 continue
             t = item.get("texto")
             if isinstance(t, str) and t.strip():
                 item["texto"] = _review_body_text(
-                    t, _path_join(p, "texto"), tracker, options, ctx, progress
+                    t, _path_join(p, "texto"), tracker, options, ctx, progress, should_cancel
                 )
             _review_or_generate_title(
-                item, _path_join(p, "titulo"), tracker, options, ctx, progress
+                item, _path_join(p, "titulo"), tracker, options, ctx, progress, should_cancel
             )
             for k, v in item.items():
                 if k in ("texto", "titulo"):
                     continue
-                _walk(v, _path_join(p, k), state, options, tracker, ctx, progress)
+                _walk(v, _path_join(p, k), state, options, tracker, ctx, progress, should_cancel)
     elif isinstance(node, dict):
-        _walk(node, path, state, options, tracker, ctx, progress)
+        _walk(node, path, state, options, tracker, ctx, progress, should_cancel)
 
 
 def _walk(
@@ -254,7 +278,9 @@ def _walk(
     tracker: DiffTracker,
     ctx: ProcessContext,
     progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
 ) -> None:
+    _raise_if_cancelled(should_cancel)
     if isinstance(node, dict):
         if _normalize_apocryphal_id(node.get("__id__")):
             state.apocryphal_zone = True
@@ -262,7 +288,7 @@ def _walk(
         if "qumran" in node:
             qpath = _path_join(path, "qumran")
             node["qumran"] = _walk_qumran(
-                node["qumran"], qpath, tracker, options, ctx, progress
+                node["qumran"], qpath, tracker, options, ctx, progress, should_cancel
             )
 
         if "comentarios" in node:
@@ -274,6 +300,7 @@ def _walk(
                 tracker,
                 ctx,
                 progress,
+                should_cancel,
             )
 
         for key in list(node.keys()):
@@ -285,16 +312,20 @@ def _walk(
                 continue
             if key == "texto" and isinstance(val, str):
                 if _should_review_biblical_texto(node, state, options):
-                    node[key] = _review_body_text(val, cur, tracker, options, ctx, progress)
+                    node[key] = _review_body_text(
+                        val, cur, tracker, options, ctx, progress, should_cancel
+                    )
                 continue
             if key == "titulo" and isinstance(val, str):
-                node[key] = _review_body_text(val, cur, tracker, options, ctx, progress)
+                node[key] = _review_body_text(
+                    val, cur, tracker, options, ctx, progress, should_cancel
+                )
                 continue
-            _walk(val, cur, state, options, tracker, ctx, progress)
+            _walk(val, cur, state, options, tracker, ctx, progress, should_cancel)
 
     elif isinstance(node, list):
         for i, item in enumerate(node):
-            _walk(item, _path_join(path, i), state, options, tracker, ctx, progress)
+            _walk(item, _path_join(path, i), state, options, tracker, ctx, progress, should_cancel)
 
 
 def process_json_document(
@@ -303,12 +334,13 @@ def process_json_document(
     tracker: DiffTracker,
     progress: ProgressCb | None = None,
     ctx: ProcessContext | None = None,
+    should_cancel: ShouldCancelCb | None = None,
 ) -> Any:
     root = copy.deepcopy(data)
     state = TraverseState()
     if ctx is None:
         ctx = ProcessContext(reviewed_text_cache={}, generated_title_cache={})
-    _walk(root, "", state, options, tracker, ctx, progress)
+    _walk(root, "", state, options, tracker, ctx, progress, should_cancel)
     return root
 
 

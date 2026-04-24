@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.services.json_processor import (
     ProcessOptions,
+    ProcessingCancelledError,
     estimate_progress_units,
     process_json_document,
 )
@@ -127,6 +128,11 @@ def _run_review_job(
     )
     try:
         total_units = estimate_progress_units(data, opts)
+        def should_cancel() -> bool:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                return bool(job and job.get("cancel_requested"))
+
         _set_job(
             job_id,
             {
@@ -165,7 +171,15 @@ def _run_review_job(
                     },
                 )
 
-        result = process_json_document(data, opts, tracker, progress=on_progress)
+        result = process_json_document(
+            data,
+            opts,
+            tracker,
+            progress=on_progress,
+            should_cancel=should_cancel,
+        )
+        if should_cancel():
+            raise ProcessingCancelledError("Processing cancelled by user")
         payload = {
             "result": result,
             "changes": tracker.to_json(),
@@ -181,6 +195,7 @@ def _run_review_job(
             job_id,
             {
                 "status": "completed",
+                "cancel_requested": False,
                 "change_count": len(tracker.changes),
                 "result_file": str(out_path),
                 "completed_units": total_units,
@@ -188,6 +203,15 @@ def _run_review_job(
                 "current_path": None,
                 "changes_live_count": len(tracker.changes),
                 "recent_changes": _serialize_recent_changes(tracker),
+            },
+        )
+    except ProcessingCancelledError as e:
+        _set_job(
+            job_id,
+            {
+                "status": "cancelled",
+                "error": str(e),
+                "current_path": None,
             },
         )
     except Exception as e:
@@ -269,6 +293,7 @@ async def review_upload_async(
         _jobs[job_id] = {
             "job_id": job_id,
             "status": "queued",
+            "cancel_requested": False,
             "filename": filename,
             "target_language": target_language,
             "treat_biblical_texto_as_google": treat_flag,
@@ -309,6 +334,7 @@ def get_review_job(job_id: str) -> dict[str, Any]:
     return {
         "job_id": job["job_id"],
         "status": job["status"],
+        "cancel_requested": job["cancel_requested"],
         "filename": job["filename"],
         "target_language": job["target_language"],
         "treat_biblical_texto_as_google": job["treat_biblical_texto_as_google"],
@@ -323,6 +349,20 @@ def get_review_job(job_id: str) -> dict[str, Any]:
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
     }
+
+
+@app.post("/api/review/jobs/{job_id}/cancel")
+def cancel_review_job(job_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job["status"] in ("completed", "failed", "cancelled"):
+            return {"job_id": job_id, "status": job["status"], "cancel_requested": False}
+        job["cancel_requested"] = True
+        job["status"] = "cancelling"
+        job["updated_at"] = _now_iso()
+        return {"job_id": job_id, "status": "cancelling", "cancel_requested": True}
 
 
 @app.get("/api/review/jobs/{job_id}/result")
