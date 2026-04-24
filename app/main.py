@@ -85,6 +85,25 @@ def _job_result_path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
 
+def _preview_text(text: str, limit: int = 220) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _serialize_recent_changes(tracker: DiffTracker, limit: int = 8) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for ch in tracker.changes[-limit:]:
+        out.append(
+            {
+                "path": ch.path,
+                "before_preview": _preview_text(ch.before),
+                "after_preview": _preview_text(ch.after),
+            }
+        )
+    return out
+
+
 def _set_job(job_id: str, updates: dict[str, Any]) -> None:
     with _jobs_lock:
         if job_id not in _jobs:
@@ -123,7 +142,7 @@ def _run_review_job(
 
         def on_progress(event: str, path: str | None) -> None:
             nonlocal completed_units, last_pushed
-            if event in ("chunk", "title_gen"):
+            if event in ("chunk", "title_gen", "memo_hit"):
                 completed_units += 1
             if path is None:
                 return
@@ -141,6 +160,8 @@ def _run_review_job(
                         "completed_units": min(completed_units, total_units),
                         "progress_pct": pct,
                         "current_path": path,
+                        "changes_live_count": len(tracker.changes),
+                        "recent_changes": _serialize_recent_changes(tracker),
                     },
                 )
 
@@ -165,6 +186,8 @@ def _run_review_job(
                 "completed_units": total_units,
                 "progress_pct": 100.0,
                 "current_path": None,
+                "changes_live_count": len(tracker.changes),
+                "recent_changes": _serialize_recent_changes(tracker),
             },
         )
     except Exception as e:
@@ -256,6 +279,8 @@ async def review_upload_async(
             "completed_units": 0,
             "progress_pct": 0.0,
             "current_path": None,
+            "changes_live_count": 0,
+            "recent_changes": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -293,6 +318,8 @@ def get_review_job(job_id: str) -> dict[str, Any]:
         "completed_units": job["completed_units"],
         "progress_pct": job["progress_pct"],
         "current_path": job["current_path"],
+        "changes_live_count": job["changes_live_count"],
+        "recent_changes": job["recent_changes"],
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
     }

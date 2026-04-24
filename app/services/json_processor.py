@@ -21,6 +21,14 @@ class ProcessOptions:
     treat_biblical_texto_as_google: bool = False
 
 
+@dataclass
+class ProcessContext:
+    # Per-document memoization:
+    # identical source texts are reviewed once, then reused across all paths.
+    reviewed_text_cache: dict[str, str]
+    generated_title_cache: dict[str, str]
+
+
 ProgressCb = Callable[[str, str | None], None]
 
 
@@ -92,8 +100,20 @@ def _review_body_text(
     path: str,
     tracker: DiffTracker,
     options: ProcessOptions,
+    ctx: ProcessContext,
     progress: ProgressCb | None,
 ) -> str:
+    cached = ctx.reviewed_text_cache.get(original)
+    if cached is not None:
+        if progress:
+            # Match estimate_progress_units: each chunk slot for this occurrence counts as one unit.
+            n = len(_chunk_string(original, settings.max_chunk_chars))
+            for j in range(n):
+                subpath = f"{path}#part{j}" if n > 1 else path
+                progress("memo_hit", subpath)
+        tracker.record(path, original, cached)
+        return cached
+
     chunks = _chunk_string(original, settings.max_chunk_chars)
     out: list[str] = []
     use_parallel = len(chunks) > 1 and settings.chunk_parallel_workers > 1
@@ -129,6 +149,7 @@ def _review_body_text(
             )
             out.append(corrected)
     merged = "".join(out)
+    ctx.reviewed_text_cache[original] = merged
     tracker.record(path, original, merged)
     return merged
 
@@ -138,6 +159,7 @@ def _review_or_generate_title(
     titulo_path: str,
     tracker: DiffTracker,
     options: ProcessOptions,
+    ctx: ProcessContext,
     progress: ProgressCb | None,
 ) -> None:
     raw = item.get("titulo")
@@ -146,18 +168,23 @@ def _review_or_generate_title(
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         if not (isinstance(body, str) and body.strip()):
             return
-        if progress:
-            progress("title_gen", titulo_path)
-        title = ai_service.generate_title(
-            body,
-            on_progress=lambda _: progress("ai", titulo_path) if progress else None,
-        )
+        title = ctx.generated_title_cache.get(body)
+        if title is None:
+            if progress:
+                progress("title_gen", titulo_path)
+            title = ai_service.generate_title(
+                body,
+                on_progress=lambda _: progress("ai", titulo_path) if progress else None,
+            )
+            ctx.generated_title_cache[body] = title
+        elif progress:
+            progress("memo_hit", titulo_path)
         item["titulo"] = title
         tracker.record(titulo_path, raw if isinstance(raw, str) else "", title)
         return
 
     if isinstance(raw, str) and raw.strip():
-        item["titulo"] = _review_body_text(raw, titulo_path, tracker, options, progress)
+        item["titulo"] = _review_body_text(raw, titulo_path, tracker, options, ctx, progress)
 
 
 def _walk_qumran(
@@ -165,6 +192,7 @@ def _walk_qumran(
     path: str,
     tracker: DiffTracker,
     options: ProcessOptions,
+    ctx: ProcessContext,
     progress: ProgressCb | None,
 ) -> Any:
     if isinstance(node, dict):
@@ -174,17 +202,17 @@ def _walk_qumran(
             if k == "texto_ingles":
                 out[k] = v
             elif isinstance(v, str):
-                out[k] = _review_body_text(v, cp, tracker, options, progress)
+                out[k] = _review_body_text(v, cp, tracker, options, ctx, progress)
             else:
-                out[k] = _walk_qumran(v, cp, tracker, options, progress)
+                out[k] = _walk_qumran(v, cp, tracker, options, ctx, progress)
         return out
     if isinstance(node, list):
         return [
-            _walk_qumran(item, _path_join(path, i), tracker, options, progress)
+            _walk_qumran(item, _path_join(path, i), tracker, options, ctx, progress)
             for i, item in enumerate(node)
         ]
     if isinstance(node, str):
-        return _review_body_text(node, path, tracker, options, progress)
+        return _review_body_text(node, path, tracker, options, ctx, progress)
     return node
 
 
@@ -194,6 +222,7 @@ def _process_comentarios(
     state: TraverseState,
     options: ProcessOptions,
     tracker: DiffTracker,
+    ctx: ProcessContext,
     progress: ProgressCb | None,
 ) -> None:
     if isinstance(node, list):
@@ -204,15 +233,17 @@ def _process_comentarios(
             t = item.get("texto")
             if isinstance(t, str) and t.strip():
                 item["texto"] = _review_body_text(
-                    t, _path_join(p, "texto"), tracker, options, progress
+                    t, _path_join(p, "texto"), tracker, options, ctx, progress
                 )
-            _review_or_generate_title(item, _path_join(p, "titulo"), tracker, options, progress)
+            _review_or_generate_title(
+                item, _path_join(p, "titulo"), tracker, options, ctx, progress
+            )
             for k, v in item.items():
                 if k in ("texto", "titulo"):
                     continue
-                _walk(v, _path_join(p, k), state, options, tracker, progress)
+                _walk(v, _path_join(p, k), state, options, tracker, ctx, progress)
     elif isinstance(node, dict):
-        _walk(node, path, state, options, tracker, progress)
+        _walk(node, path, state, options, tracker, ctx, progress)
 
 
 def _walk(
@@ -221,6 +252,7 @@ def _walk(
     state: TraverseState,
     options: ProcessOptions,
     tracker: DiffTracker,
+    ctx: ProcessContext,
     progress: ProgressCb | None,
 ) -> None:
     if isinstance(node, dict):
@@ -230,7 +262,7 @@ def _walk(
         if "qumran" in node:
             qpath = _path_join(path, "qumran")
             node["qumran"] = _walk_qumran(
-                node["qumran"], qpath, tracker, options, progress
+                node["qumran"], qpath, tracker, options, ctx, progress
             )
 
         if "comentarios" in node:
@@ -240,6 +272,7 @@ def _walk(
                 state,
                 options,
                 tracker,
+                ctx,
                 progress,
             )
 
@@ -252,16 +285,16 @@ def _walk(
                 continue
             if key == "texto" and isinstance(val, str):
                 if _should_review_biblical_texto(node, state, options):
-                    node[key] = _review_body_text(val, cur, tracker, options, progress)
+                    node[key] = _review_body_text(val, cur, tracker, options, ctx, progress)
                 continue
             if key == "titulo" and isinstance(val, str):
-                node[key] = _review_body_text(val, cur, tracker, options, progress)
+                node[key] = _review_body_text(val, cur, tracker, options, ctx, progress)
                 continue
-            _walk(val, cur, state, options, tracker, progress)
+            _walk(val, cur, state, options, tracker, ctx, progress)
 
     elif isinstance(node, list):
         for i, item in enumerate(node):
-            _walk(item, _path_join(path, i), state, options, tracker, progress)
+            _walk(item, _path_join(path, i), state, options, tracker, ctx, progress)
 
 
 def process_json_document(
@@ -269,10 +302,13 @@ def process_json_document(
     options: ProcessOptions,
     tracker: DiffTracker,
     progress: ProgressCb | None = None,
+    ctx: ProcessContext | None = None,
 ) -> Any:
     root = copy.deepcopy(data)
     state = TraverseState()
-    _walk(root, "", state, options, tracker, progress)
+    if ctx is None:
+        ctx = ProcessContext(reviewed_text_cache={}, generated_title_cache={})
+    _walk(root, "", state, options, tracker, ctx, progress)
     return root
 
 
