@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # Run from backend/: PYTHONPATH=. python scripts/review_json_file.py ...
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +21,48 @@ from app.services.json_processor import (  # noqa: E402
     process_json_document,
 )
 from app.utils.diff_tracker import DiffTracker  # noqa: E402
+
+
+def _is_daily_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    patterns = (
+        "requests per day",
+        "rpd",
+        "rate limit reached",
+        "used",
+        "limit",
+    )
+    return all(p in msg for p in ("rate limit", "day")) or (
+        "429" in msg and all(p in msg for p in patterns)
+    )
+
+
+def _extract_retry_hint_seconds(exc: BaseException) -> int | None:
+    msg = str(exc)
+    # Common variants:
+    # "Please try again in 8.64s."
+    # "Try again in 2m30s."
+    sec_match = re.search(r"try again in\s+(\d+(?:\.\d+)?)s", msg, flags=re.I)
+    if sec_match:
+        return max(1, int(float(sec_match.group(1))))
+    min_sec_match = re.search(r"try again in\s+(\d+)m(\d+)s", msg, flags=re.I)
+    if min_sec_match:
+        return int(min_sec_match.group(1)) * 60 + int(min_sec_match.group(2))
+    return None
+
+
+def _checkpoint_path_for_output(out_path: Path) -> Path:
+    return out_path.with_suffix(out_path.suffix + ".resume.json")
+
+
+def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise SystemExit(f"Resume checkpoint not found: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def main() -> None:
@@ -67,6 +111,15 @@ def main() -> None:
         default=None,
         help="With --by-livro: stop before this index (default: len(livros)).",
     )
+    ap.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "Resume from a checkpoint JSON created by this script "
+            "(default checkpoint path: OUTPUT.resume.json)."
+        ),
+    )
     args = ap.parse_args()
 
     inp: Path = args.input
@@ -81,6 +134,10 @@ def main() -> None:
         out = inp
     else:
         out = args.output or inp.with_name(inp.stem + ".reviewed.json")
+    resume_path = args.resume_from or _checkpoint_path_for_output(out)
+
+    if args.resume_from and not args.by_livro:
+        raise SystemExit("--resume-from currently requires --by-livro.")
 
     print(f"Loading {inp} ...", flush=True)
     t0 = time.time()
@@ -125,25 +182,107 @@ def main() -> None:
         if start >= end:
             raise SystemExit(f"Invalid livro range: start={start} end={end}")
 
-        # Same rules as About.md / the web UI: write a full document early, then refresh per book.
-        out.write_text(
-            json.dumps(root, ensure_ascii=False, indent=4),
-            encoding="utf-8",
-        )
-        print(f"Wrote initial copy -> {out}", flush=True)
+        # Resume support:
+        # - If checkpoint exists, continue from saved state.
+        # - Otherwise start fresh and create output skeleton.
+        if resume_path.is_file():
+            cp = _load_checkpoint(resume_path)
+            if cp.get("input_path") != str(inp.resolve()):
+                raise SystemExit(
+                    f"Checkpoint input mismatch:\n  checkpoint={cp.get('input_path')}\n  current={inp.resolve()}"
+                )
+            checkpoint_out = Path(cp.get("output_path", out))
+            if checkpoint_out.resolve() != out.resolve():
+                raise SystemExit(
+                    f"Checkpoint output mismatch:\n  checkpoint={checkpoint_out}\n  current={out.resolve()}"
+                )
+            next_index = int(cp.get("next_livro_index", start))
+            start = min(max(next_index, start), end)
+            if out.is_file():
+                root = json.loads(out.read_text(encoding="utf-8"))
+                livros = root["livros"]
+                print(f"Resuming from existing output {out}", flush=True)
+            else:
+                print("Checkpoint found but output file missing; rebuilding from input.", flush=True)
+                out.write_text(
+                    json.dumps(root, ensure_ascii=False, indent=4),
+                    encoding="utf-8",
+                )
+            print(f"Resuming at livros[{start}] from {resume_path}", flush=True)
+        else:
+            out.write_text(
+                json.dumps(root, ensure_ascii=False, indent=4),
+                encoding="utf-8",
+            )
+            print(f"Wrote initial copy -> {out}", flush=True)
+            _save_checkpoint(
+                resume_path,
+                {
+                    "input_path": str(inp.resolve()),
+                    "output_path": str(out.resolve()),
+                    "next_livro_index": start,
+                    "livro_end": end,
+                    "updated_at": int(time.time()),
+                },
+            )
+            print(f"Created checkpoint -> {resume_path}", flush=True)
 
         ctx = ProcessContext(reviewed_text_cache={}, generated_title_cache={})
         for i in range(start, end):
             bid = livros[i].get("__id__", i) if isinstance(livros[i], dict) else i
             print(f"--- livros[{i}] ({bid!r}) ---", flush=True)
             wrapped = {"livros": [copy.deepcopy(livros[i])]}
-            processed = process_json_document(
-                wrapped, opts, tracker, progress=on_progress, ctx=ctx
-            )
+            try:
+                processed = process_json_document(
+                    wrapped, opts, tracker, progress=on_progress, ctx=ctx
+                )
+            except Exception as exc:
+                # Keep checkpoint at current index so rerun continues from the same livro.
+                _save_checkpoint(
+                    resume_path,
+                    {
+                        "input_path": str(inp.resolve()),
+                        "output_path": str(out.resolve()),
+                        "next_livro_index": i,
+                        "livro_end": end,
+                        "updated_at": int(time.time()),
+                        "last_error": str(exc),
+                    },
+                )
+                if _is_daily_rate_limit_error(exc):
+                    print(
+                        f"\nDaily request cap reached near livros[{i}]. "
+                        f"Checkpoint saved to {resume_path}",
+                        flush=True,
+                    )
+                    print(
+                        "Increase RPD/quota or rerun after reset with the same command; "
+                        "it will resume automatically.",
+                        flush=True,
+                    )
+                else:
+                    hint = _extract_retry_hint_seconds(exc)
+                    if hint is not None:
+                        print(
+                            f"\nRate-limited near livros[{i}] (retry hint: ~{hint}s). "
+                            f"Checkpoint saved to {resume_path}",
+                            flush=True,
+                        )
+                raise
             livros[i] = processed["livros"][0]
             out.write_text(
                 json.dumps(root, ensure_ascii=False, indent=4),
                 encoding="utf-8",
+            )
+            _save_checkpoint(
+                resume_path,
+                {
+                    "input_path": str(inp.resolve()),
+                    "output_path": str(out.resolve()),
+                    "next_livro_index": i + 1,
+                    "livro_end": end,
+                    "updated_at": int(time.time()),
+                },
             )
             print(f"Saved after livros[{i}] ({time.time() - t1:.0f}s elapsed)", flush=True)
 
@@ -166,6 +305,12 @@ def main() -> None:
     )
     print(f"Wrote {out}", flush=True)
     print(f"Wrote {changes_path} ({len(tracker.changes)} entries)", flush=True)
+    if resume_path.is_file():
+        try:
+            resume_path.unlink()
+            print(f"Removed checkpoint {resume_path}", flush=True)
+        except OSError:
+            print(f"Finished, but could not remove checkpoint {resume_path}", flush=True)
 
 
 if __name__ == "__main__":
