@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import tempfile
 import time
 import uuid
@@ -31,10 +32,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Multilingual Text Review API", version="1.0.0")
 
+raw_origins = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,https://ai-translator-a89r.vercel.app",
+)
+allow_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
