@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import OrderedDict
 from threading import Lock
 from typing import Callable
 
-from openai import OpenAI
+import httpx
+from openai import AsyncOpenAI
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 _cache_lock = Lock()
 _cache: OrderedDict[str, str] = OrderedDict()
+
+_async_client_lock = Lock()
+_async_client: AsyncOpenAI | None = None
 
 SYSTEM_PROMPT = """You are a linguistic correction tool for sensitive religious and scholarly texts.
 
@@ -33,11 +38,30 @@ Rules (strict):
 Return ONLY the corrected text with no quotes, no preamble, and no explanation."""
 
 
-def _client() -> OpenAI:
-    kwargs: dict = {"api_key": settings.openai_api_key or None}
-    if settings.openai_base_url:
-        kwargs["base_url"] = settings.openai_base_url
-    return OpenAI(**kwargs)
+def _async_client_singleton() -> AsyncOpenAI:
+    """Lazy singleton AsyncOpenAI client.
+
+    Reusing one client across the whole job avoids per-request HTTP setup
+    overhead and lets httpx reuse keep-alive connections, which is critical
+    when issuing many requests in parallel.
+    """
+    global _async_client
+    if _async_client is not None:
+        return _async_client
+    with _async_client_lock:
+        if _async_client is None:
+            kwargs: dict = {"api_key": settings.openai_api_key or None}
+            if settings.openai_base_url:
+                kwargs["base_url"] = settings.openai_base_url
+            kwargs["http_client"] = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=max(64, settings.ai_max_concurrency * 4),
+                    max_keepalive_connections=max(32, settings.ai_max_concurrency * 2),
+                ),
+                timeout=httpx.Timeout(120.0, connect=20.0),
+            )
+            _async_client = AsyncOpenAI(**kwargs)
+    return _async_client
 
 
 def _cache_get(key: str) -> str | None:
@@ -111,11 +135,12 @@ def _normalize_title_text(title: str) -> str:
     return out
 
 
-def correct_text(
+async def correct_text(
     text: str,
     *,
     target_language_hint: str | None = None,
     on_progress: Callable[[str], None] | None = None,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> str:
     if not text.strip():
         return text
@@ -142,15 +167,23 @@ Return ONLY the corrected text."""
     if on_progress:
         on_progress("ai_request")
 
-    resp = _client().chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.1,
-    )
-    out = (resp.choices[0].message.content or "").strip()
+    async def _run() -> str:
+        resp = await _async_client_singleton().chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.1,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    if semaphore is not None:
+        async with semaphore:
+            out = await _run()
+    else:
+        out = await _run()
+
     if on_progress:
         on_progress("ai_done")
     final = _normalize_corrected_text(text, out)
@@ -158,7 +191,12 @@ Return ONLY the corrected text."""
     return final
 
 
-def generate_title(text: str, *, on_progress: Callable[[str], None] | None = None) -> str:
+async def generate_title(
+    text: str,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> str:
     if not settings.openai_api_key:
         raise ValueError("OPENAI_API_KEY is not set. Add it to backend/.env")
     cache_key = f"title|{settings.openai_model}|{text[:8000]}"
@@ -180,18 +218,26 @@ Return ONLY the title line."""
     if on_progress:
         on_progress("ai_title")
 
-    resp = _client().chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You write short, neutral scholarly titles. Output only the title.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    title = (resp.choices[0].message.content or "").strip().split("\n")[0].strip()
+    async def _run() -> str:
+        resp = await _async_client_singleton().chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write short, neutral scholarly titles. Output only the title.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip().split("\n")[0].strip()
+
+    if semaphore is not None:
+        async with semaphore:
+            title = await _run()
+    else:
+        title = await _run()
+
     if on_progress:
         on_progress("ai_title_done")
     final = _normalize_title_text(title if title else "Untitled")

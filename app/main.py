@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
@@ -24,6 +23,7 @@ from app.services.json_processor import (
     ProcessingCancelledError,
     estimate_progress_units,
     process_json_document,
+    process_json_document_async,
 )
 from app.utils.diff_tracker import DiffTracker
 
@@ -330,7 +330,11 @@ def _run_review_job(
             isinstance(data, dict) and isinstance(data.get("livros"), list)
         )
         if can_resume_by_livro:
-            root = copy.deepcopy(data)
+            # Mutate `data` in place. The original deep copy here plus another
+            # deep copy per book added significant overhead (and memory churn)
+            # for large multi-megabyte documents without any safety benefit:
+            # `data` is owned exclusively by this background task.
+            root = data
             livros = root["livros"]
             ctx = ProcessContext(
                 reviewed_text_cache={},
@@ -348,15 +352,19 @@ def _run_review_job(
             while next_idx < end_idx:
                 if should_cancel():
                     raise ProcessingCancelledError("Processing cancelled by user")
-                wrapped = {"livros": [copy.deepcopy(livros[next_idx])]}
+                # `wrapped` reuses the same livro object; processing happens
+                # in place so the result is reflected in `livros[next_idx]`
+                # without any copy.
+                wrapped = {"livros": [livros[next_idx]]}
                 try:
-                    processed = process_json_document(
+                    process_json_document(
                         wrapped,
                         opts,
                         tracker,
                         progress=on_progress,
                         ctx=ctx,
                         should_cancel=should_cancel,
+                        in_place=True,
                     )
                 except Exception as e:
                     _save_checkpoint(
@@ -402,7 +410,7 @@ def _run_review_job(
                         )
                         continue
                     raise
-                livros[next_idx] = processed["livros"][0]
+                # `livros[next_idx]` was mutated in place by process_json_document.
                 next_idx += 1
                 _save_checkpoint(
                     job_id,
@@ -431,6 +439,7 @@ def _run_review_job(
                 tracker,
                 progress=on_progress,
                 should_cancel=should_cancel,
+                in_place=True,
             )
         if should_cancel():
             raise ProcessingCancelledError("Processing cancelled by user")
@@ -510,7 +519,11 @@ async def review_upload(
         treat_biblical_texto_as_google=_form_bool(treat_biblical_texto_as_google),
     )
     try:
-        result = process_json_document(data, opts, tracker, progress=None)
+        # This handler is `async def`, so we already have a running event
+        # loop and must use the async-native entry point.
+        result = await process_json_document_async(
+            data, opts, tracker, progress=None, in_place=True
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
