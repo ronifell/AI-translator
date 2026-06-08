@@ -18,6 +18,7 @@ _cache: OrderedDict[str, str] = OrderedDict()
 
 _async_client_lock = Lock()
 _async_client: AsyncOpenAI | None = None
+_async_client_loop: asyncio.AbstractEventLoop | None = None
 
 SYSTEM_PROMPT = """You are a linguistic correction tool for sensitive religious and scholarly texts.
 
@@ -39,28 +40,42 @@ Return ONLY the corrected text with no quotes, no preamble, and no explanation."
 
 
 def _async_client_singleton() -> AsyncOpenAI:
-    """Lazy singleton AsyncOpenAI client.
+    """Lazy AsyncOpenAI client, rebuilt on event-loop changes.
 
-    Reusing one client across the whole job avoids per-request HTTP setup
-    overhead and lets httpx reuse keep-alive connections, which is critical
-    when issuing many requests in parallel.
+    httpx.AsyncClient (used internally by AsyncOpenAI) keeps connections
+    that are bound to the asyncio event loop that created them. The review
+    pipeline calls `asyncio.run(...)` once per livro, which creates a new
+    event loop each time and closes it when done. If we returned the same
+    client across multiple loops, requests would silently hang against
+    connections from a closed loop.
+
+    To stay safe we track the loop that owns the current client and
+    rebuild the client whenever the loop has changed. Within a single
+    loop the singleton is reused, so connection-pool keep-alive is still
+    honored across all requests in that loop.
     """
-    global _async_client
-    if _async_client is not None:
+    global _async_client, _async_client_loop
+    loop = asyncio.get_running_loop()
+    if _async_client is not None and _async_client_loop is loop:
         return _async_client
     with _async_client_lock:
-        if _async_client is None:
-            kwargs: dict = {"api_key": settings.openai_api_key or None}
-            if settings.openai_base_url:
-                kwargs["base_url"] = settings.openai_base_url
-            kwargs["http_client"] = httpx.AsyncClient(
-                limits=httpx.Limits(
-                    max_connections=max(64, settings.ai_max_concurrency * 4),
-                    max_keepalive_connections=max(32, settings.ai_max_concurrency * 2),
-                ),
-                timeout=httpx.Timeout(120.0, connect=20.0),
-            )
-            _async_client = AsyncOpenAI(**kwargs)
+        if _async_client is not None and _async_client_loop is loop:
+            return _async_client
+        kwargs: dict = {"api_key": settings.openai_api_key or None}
+        if settings.openai_base_url:
+            kwargs["base_url"] = settings.openai_base_url
+        kwargs["http_client"] = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max(64, settings.ai_max_concurrency * 4),
+                max_keepalive_connections=max(32, settings.ai_max_concurrency * 2),
+            ),
+            timeout=httpx.Timeout(120.0, connect=20.0),
+        )
+        # The previous client (if any) belongs to a now-closed loop and is
+        # left to garbage collection. We deliberately don't try to aclose()
+        # it because its loop is gone.
+        _async_client = AsyncOpenAI(**kwargs)
+        _async_client_loop = loop
     return _async_client
 
 
