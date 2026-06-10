@@ -61,7 +61,10 @@ def _async_client_singleton() -> AsyncOpenAI:
     with _async_client_lock:
         if _async_client is not None and _async_client_loop is loop:
             return _async_client
-        kwargs: dict = {"api_key": settings.openai_api_key or None}
+        kwargs: dict = {
+            "api_key": settings.openai_api_key or None,
+            "max_retries": settings.openai_max_retries,
+        }
         if settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
         kwargs["http_client"] = httpx.AsyncClient(

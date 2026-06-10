@@ -2,12 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import logging
+import re
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable
+
+import httpx
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from app.services import ai_service
 from app.config import settings
 from app.utils.diff_tracker import DiffTracker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +57,12 @@ class ProcessContext:
     reviewed_text_futures: dict[str, asyncio.Future] = field(default_factory=dict)
     generated_title_futures: dict[str, asyncio.Future] = field(default_factory=dict)
     ai_semaphore: asyncio.Semaphore | None = None
+    # Optional durable, content-addressed result store. When provided, every
+    # successfully corrected chunk / generated title is persisted immediately so
+    # that a restart or retry re-uses it instead of calling the API again. This
+    # is what makes resume work for *any* JSON structure (not just `livros`).
+    durable_get: Callable[[str], str | None] | None = None
+    durable_put: Callable[[str, str], None] | None = None
 
 
 ProgressCb = Callable[[str, str | None], None]
@@ -52,6 +76,164 @@ class ProcessingCancelledError(RuntimeError):
 def _raise_if_cancelled(should_cancel: ShouldCancelCb | None) -> None:
     if should_cancel and should_cancel():
         raise ProcessingCancelledError("Processing cancelled by user")
+
+
+def _is_daily_rate_limit_error(exc: BaseException) -> bool:
+    """True when a rate-limit error specifically concerns the *daily* quota."""
+    msg = str(exc).lower()
+    has_rate_limit_signal = any(
+        s in msg
+        for s in ("rate limit", "too many requests", "error code: 429", "status code 429")
+    )
+    has_daily_signal = any(
+        s in msg
+        for s in ("requests per day", "rpd", "max_requests_per_1_day", "per_1_day", " per day")
+    )
+    return has_rate_limit_signal and has_daily_signal
+
+
+def _classify_error(exc: BaseException) -> str:
+    """Bucket an exception so the resilience loop knows how to react.
+
+    Returns one of: "auth" (stop the job, config problem), "daily" (pause until
+    quota reset), "transient" (retry indefinitely with backoff), "fatal" (skip
+    this single unit), or "unknown" (retry a bounded number of times).
+    """
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return "auth"
+    # Configuration problems (e.g. missing OPENAI_API_KEY) surface as ValueError
+    # from ai_service; retrying cannot help, so stop the job with a clear message.
+    if isinstance(exc, ValueError):
+        return "auth"
+    if _is_daily_rate_limit_error(exc):
+        return "daily"
+    if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)):
+        return "transient"
+    if isinstance(exc, APIStatusError):
+        code = getattr(exc, "status_code", None)
+        if isinstance(code, int) and (code == 429 or code >= 500):
+            return "transient"
+        return "fatal"
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return "transient"
+    if isinstance(exc, BadRequestError):
+        return "fatal"
+    return "unknown"
+
+
+def _extract_retry_hint_seconds(exc: BaseException) -> int | None:
+    msg = str(exc)
+    m = re.search(r"try again in\s+(\d+(?:\.\d+)?)s", msg, flags=re.I)
+    if m:
+        return max(1, int(float(m.group(1))))
+    m = re.search(r"try again in\s+(\d+)m(\d+)s", msg, flags=re.I)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
+def _next_utc_midnight_iso() -> str:
+    now = datetime.now(timezone.utc)
+    next_day = (now + timedelta(days=1)).date()
+    return datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+
+def _seconds_until_next_utc_midnight() -> int:
+    now = datetime.now(timezone.utc)
+    next_day = (now + timedelta(days=1)).date()
+    midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
+    return max(int((midnight - now).total_seconds()), 0)
+
+
+async def _sleep_with_cancel(seconds: float, should_cancel: ShouldCancelCb | None) -> None:
+    """Sleep in short slices so cancellation is honored promptly."""
+    remaining = seconds
+    while remaining > 0:
+        _raise_if_cancelled(should_cancel)
+        step = min(remaining, 5.0)
+        await asyncio.sleep(step)
+        remaining -= step
+    _raise_if_cancelled(should_cancel)
+
+
+async def _wait_until_next_utc_midnight(should_cancel: ShouldCancelCb | None) -> None:
+    while True:
+        _raise_if_cancelled(should_cancel)
+        remaining = _seconds_until_next_utc_midnight()
+        if remaining <= 0:
+            return
+        await _sleep_with_cancel(min(remaining, 60), should_cancel)
+
+
+def _durable_key(kind: str, model: str, lang: str, text: str) -> str:
+    """Stable content-addressed key for the durable result store."""
+    h = hashlib.sha256(f"{kind}\x00{model}\x00{lang}\x00{text}".encode("utf-8")).hexdigest()
+    return f"{kind}:{h}"
+
+
+# Sentinel returned by the resilience wrapper when a unit could not be processed
+# and must keep its original text (fatal, non-retryable error on that unit).
+_SKIP_UNIT = object()
+
+
+async def _call_ai_resilient(
+    coro_factory: Callable[[], Awaitable[str]],
+    *,
+    path: str | None,
+    progress: ProgressCb | None,
+    should_cancel: ShouldCancelCb | None,
+) -> Any:
+    """Run an AI call, riding through rate limits and transient failures.
+
+    - daily limit  -> pause until UTC midnight, then retry (never fails)
+    - transient    -> exponential backoff, retry indefinitely (never fails)
+    - unknown      -> bounded retries, then re-raise
+    - auth         -> re-raise immediately (config problem; whole job stops)
+    - fatal/unit   -> return `_SKIP_UNIT` so the caller keeps the original text
+    """
+    attempt = 0
+    backoff = 1.0
+    max_backoff = float(max(1, settings.ai_retry_max_backoff_seconds))
+    while True:
+        _raise_if_cancelled(should_cancel)
+        try:
+            return await coro_factory()
+        except (ProcessingCancelledError, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - classified below
+            kind = _classify_error(exc)
+            if kind == "auth":
+                raise
+            if kind == "daily":
+                if not settings.ai_daily_limit_pause_enabled:
+                    raise
+                logger.warning("Daily rate limit hit; pausing until UTC midnight.")
+                if progress:
+                    progress("paused", _next_utc_midnight_iso())
+                await _wait_until_next_utc_midnight(should_cancel)
+                if progress:
+                    progress("resumed", path)
+                continue
+            if kind == "fatal":
+                if not settings.ai_isolate_fatal_units:
+                    raise
+                logger.warning("Skipping unit %s after non-retryable error: %s", path, exc)
+                if progress:
+                    progress("skipped", path)
+                return _SKIP_UNIT
+            # transient or unknown
+            attempt += 1
+            if kind == "unknown" and attempt >= settings.ai_unknown_error_max_attempts:
+                raise
+            hint = _extract_retry_hint_seconds(exc)
+            delay = float(hint) if hint is not None else min(backoff, max_backoff)
+            logger.info(
+                "Transient AI error on %s (attempt %d, retrying in %.0fs): %s",
+                path, attempt, delay, exc,
+            )
+            await _sleep_with_cancel(delay, should_cancel)
+            backoff = min(backoff * 2, max_backoff)
+            continue
 
 
 def _path_join(base: str, key: str | int) -> str:
@@ -132,6 +314,15 @@ async def _correct_chunk(
     if cached is not None:
         return cached
 
+    dkey: str | None = None
+    if ctx.durable_get is not None or ctx.durable_put is not None:
+        dkey = _durable_key("correct", settings.openai_model, options.target_language, chunk)
+    if ctx.durable_get is not None and dkey is not None:
+        dval = ctx.durable_get(dkey)
+        if dval is not None:
+            ctx.reviewed_text_cache[chunk] = dval
+            return dval
+
     pending = ctx.reviewed_text_futures.get(chunk)
     if pending is not None:
         return await pending
@@ -139,21 +330,29 @@ async def _correct_chunk(
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     ctx.reviewed_text_futures[chunk] = fut
     try:
-        corrected = await ai_service.correct_text(
-            chunk,
-            target_language_hint=options.target_language,
-            on_progress=(
-                (lambda _ev, sp=progress_subpath: progress("ai", sp))
-                if progress
-                else None
+        result = await _call_ai_resilient(
+            lambda: ai_service.correct_text(
+                chunk,
+                target_language_hint=options.target_language,
+                on_progress=(
+                    (lambda _ev, sp=progress_subpath: progress("ai", sp))
+                    if progress
+                    else None
+                ),
+                semaphore=ctx.ai_semaphore,
             ),
-            semaphore=ctx.ai_semaphore,
+            path=progress_subpath,
+            progress=progress,
+            should_cancel=should_cancel,
         )
+        corrected = chunk if result is _SKIP_UNIT else result
         ctx.reviewed_text_cache[chunk] = corrected
+        if ctx.durable_put is not None and dkey is not None and result is not _SKIP_UNIT:
+            ctx.durable_put(dkey, corrected)
         if not fut.done():
             fut.set_result(corrected)
         return corrected
-    except Exception as e:
+    except BaseException as e:
         if not fut.done():
             fut.set_exception(e)
         ctx.reviewed_text_futures.pop(chunk, None)
@@ -225,6 +424,17 @@ async def _generate_title_for(
             progress("memo_hit", titulo_path)
         return cached
 
+    dkey: str | None = None
+    if ctx.durable_get is not None or ctx.durable_put is not None:
+        dkey = _durable_key("title", settings.openai_model, "", body[:8000])
+    if ctx.durable_get is not None and dkey is not None:
+        dval = ctx.durable_get(dkey)
+        if dval is not None:
+            ctx.generated_title_cache[body] = dval
+            if progress:
+                progress("memo_hit", titulo_path)
+            return dval
+
     pending = ctx.generated_title_futures.get(body)
     if pending is not None:
         return await pending
@@ -234,20 +444,28 @@ async def _generate_title_for(
     try:
         if progress:
             progress("title_gen", titulo_path)
-        title = await ai_service.generate_title(
-            body,
-            on_progress=(
-                (lambda _ev, sp=titulo_path: progress("ai", sp))
-                if progress
-                else None
+        result = await _call_ai_resilient(
+            lambda: ai_service.generate_title(
+                body,
+                on_progress=(
+                    (lambda _ev, sp=titulo_path: progress("ai", sp))
+                    if progress
+                    else None
+                ),
+                semaphore=ctx.ai_semaphore,
             ),
-            semaphore=ctx.ai_semaphore,
+            path=titulo_path,
+            progress=progress,
+            should_cancel=should_cancel,
         )
+        title = "" if result is _SKIP_UNIT else result
         ctx.generated_title_cache[body] = title
+        if ctx.durable_put is not None and dkey is not None and result is not _SKIP_UNIT:
+            ctx.durable_put(dkey, title)
         if not fut.done():
             fut.set_result(title)
         return title
-    except Exception as e:
+    except BaseException as e:
         if not fut.done():
             fut.set_exception(e)
         ctx.generated_title_futures.pop(body, None)

@@ -6,7 +6,7 @@ import os
 import tempfile
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from threading import Thread
@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from openai import AuthenticationError, PermissionDeniedError
 from pydantic import BaseModel, Field
 
 from app.services.json_processor import (
@@ -97,8 +98,18 @@ def _job_result_path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
 
-def _job_checkpoint_path(job_id: str) -> Path:
-    return JOB_DIR / f"{job_id}.checkpoint.json"
+def _job_source_path(job_id: str) -> Path:
+    """Pristine uploaded document, kept on disk for crash/restart recovery."""
+    return JOB_DIR / f"{job_id}.source.json"
+
+
+def _job_cache_path(job_id: str) -> Path:
+    """Append-only, content-addressed store of every corrected unit."""
+    return JOB_DIR / f"{job_id}.cache.jsonl"
+
+
+def _job_meta_path(job_id: str) -> Path:
+    return JOB_DIR / f"{job_id}.meta.json"
 
 
 def _preview_text(text: str, limit: int = 220) -> str:
@@ -128,73 +139,94 @@ def _set_job(job_id: str, updates: dict[str, Any]) -> None:
         _jobs[job_id]["updated_at"] = _now_iso()
 
 
-def _is_daily_rate_limit_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    has_rate_limit_signal = any(
-        s in msg
-        for s in (
-            "rate limit",
-            "too many requests",
-            "error code: 429",
-            "status code 429",
-        )
-    )
-    has_daily_signal = any(
-        s in msg
-        for s in (
-            "requests per day",
-            "rpd",
-            "max_requests_per_1_day",
-            "per_1_day",
-        )
-    )
-    return has_rate_limit_signal and has_daily_signal
-
-
-def _next_utc_midnight_iso() -> str:
-    now = datetime.now(timezone.utc)
-    next_day = (now + timedelta(days=1)).date()
-    midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
-    return midnight.isoformat()
-
-
-def _seconds_until_next_utc_midnight(min_seconds: int = 300) -> int:
-    now = datetime.now(timezone.utc)
-    next_day = (now + timedelta(days=1)).date()
-    midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
-    seconds = int((midnight - now).total_seconds())
-    return max(seconds, min_seconds)
-
-
-def _wait_until_next_utc_midnight_or_cancel(should_cancel: Any) -> bool:
-    # Sleep in short intervals so cancel requests can be honored.
-    while True:
-        if should_cancel():
-            return True
-        remaining = _seconds_until_next_utc_midnight(min_seconds=0)
-        if remaining <= 0:
-            return False
-        time.sleep(min(remaining, 60))
-
-
-def _save_checkpoint(job_id: str, payload: dict[str, Any]) -> None:
-    _job_checkpoint_path(job_id).write_text(
-        json.dumps(payload, ensure_ascii=False),
+def _save_source(job_id: str, data: Any) -> None:
+    _job_source_path(job_id).write_text(
+        json.dumps(data, ensure_ascii=False),
         encoding="utf-8",
     )
 
 
-def _load_checkpoint(job_id: str) -> dict[str, Any] | None:
-    p = _job_checkpoint_path(job_id)
+def _save_meta(job_id: str, meta: dict[str, Any]) -> None:
+    _job_meta_path(job_id).write_text(
+        json.dumps(meta, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_meta(job_id: str) -> dict[str, Any] | None:
+    p = _job_meta_path(job_id)
     if not p.exists():
         return None
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("failed to parse job meta: %s", p)
+        return None
 
 
-def _clear_checkpoint(job_id: str) -> None:
-    p = _job_checkpoint_path(job_id)
-    if p.exists():
-        p.unlink()
+def _cleanup_job_files(job_id: str) -> None:
+    """Remove the recovery artifacts once a job reaches a clean terminal state.
+
+    Their absence is the signal that the job is no longer mid-flight: any
+    leftover `*.source.json` means the process died before finishing and the
+    job should be resumed on startup.
+    """
+    for p in (_job_source_path(job_id), _job_cache_path(job_id), _job_meta_path(job_id)):
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError:
+            logger.warning("could not remove job artifact %s", p)
+
+
+class _DurableCache:
+    """Content-addressed, append-only result store for one job.
+
+    Each corrected chunk / generated title is written as a JSON line the moment
+    it is produced, so a restart or retry serves it from disk instead of calling
+    the API again. Keyed by a content hash, it makes resume work for any JSON
+    shape and replaces the old whole-document checkpoint (which rewrote the
+    entire file after every book).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._store: dict[str, str] = {}
+        self._lock = Lock()
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                k, v = obj.get("k"), obj.get("v")
+                if isinstance(k, str) and isinstance(v, str):
+                    self._store[k] = v
+        self._fh = path.open("a", encoding="utf-8")
+
+    @property
+    def hits_on_load(self) -> int:
+        return len(self._store)
+
+    def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+    def put(self, key: str, value: str) -> None:
+        with self._lock:
+            if key in self._store:
+                return
+            self._store[key] = value
+            self._fh.write(json.dumps({"k": key, "v": value}, ensure_ascii=False) + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
 
 def _spawn_resume_thread(
@@ -219,29 +251,27 @@ def _spawn_resume_thread(
 
 
 def _recover_jobs_on_startup() -> None:
-    for cp_path in JOB_DIR.glob("*.checkpoint.json"):
-        try:
-            cp = json.loads(cp_path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.exception("failed to parse checkpoint: %s", cp_path)
-            continue
-        partial = cp.get("partial_result")
-        if not isinstance(partial, dict):
-            logger.warning("checkpoint missing partial_result: %s", cp_path)
-            continue
-        # "<job_id>.checkpoint.json" -> "<job_id>"
-        suffix = ".checkpoint.json"
-        name = cp_path.name
+    """Resume any job whose source file is still present (i.e. it was mid-flight
+    when the process stopped). The durable cache makes this near-instant for
+    work already completed before the interruption."""
+    for src_path in JOB_DIR.glob("*.source.json"):
+        suffix = ".source.json"
+        name = src_path.name
         if not name.endswith(suffix):
             continue
         job_id = name[: -len(suffix)]
+        if _job_result_path(job_id).exists():
+            continue
+        try:
+            data = json.loads(src_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("failed to parse job source: %s", src_path)
+            continue
+        meta = _load_meta(job_id) or {}
         now = _now_iso()
-        filename = str(cp.get("filename", "document.json"))
-        target_language = str(cp.get("target_language", "pt-BR"))
-        treat_flag = bool(cp.get("treat_biblical_texto_as_google", False))
-        total_units = cp.get("total_units")
-        completed_units = int(cp.get("completed_units", 0))
-        progress_pct = float(cp.get("progress_pct", 0.0))
+        filename = str(meta.get("filename", "document.json"))
+        target_language = str(meta.get("target_language", "pt-BR"))
+        treat_flag = bool(meta.get("treat_biblical_texto_as_google", False))
         with _jobs_lock:
             if job_id not in _jobs:
                 _jobs[job_id] = {
@@ -254,18 +284,25 @@ def _recover_jobs_on_startup() -> None:
                     "change_count": None,
                     "error": None,
                     "result_file": None,
-                    "total_units": total_units,
-                    "completed_units": completed_units,
-                    "progress_pct": progress_pct,
+                    "total_units": meta.get("total_units"),
+                    "completed_units": 0,
+                    "progress_pct": 0.0,
                     "current_path": None,
-                    "changes_live_count": int(cp.get("changes_live_count", 0)),
+                    "changes_live_count": 0,
                     "recent_changes": [],
                     "resume_after": None,
-                    "created_at": str(cp.get("created_at", now)),
+                    "created_at": str(meta.get("created_at", now)),
                     "updated_at": now,
                 }
-        logger.info("recovering paused review job %s from checkpoint", job_id)
-        _spawn_resume_thread(job_id, partial, filename, target_language, treat_flag)
+        logger.info("recovering interrupted review job %s from source + cache", job_id)
+        _spawn_resume_thread(job_id, data, filename, target_language, treat_flag)
+
+
+# Bounded full-document restarts for *unexpected* errors. Rate limits and
+# transient API failures are handled inside the pipeline and never reach here;
+# these restarts cover crashes/bugs, and the durable cache makes each restart
+# skip all previously completed work.
+_JOB_MAX_RESTARTS = 5
 
 
 def _run_review_job(
@@ -276,18 +313,33 @@ def _run_review_job(
     treat_biblical_texto_as_google: bool,
 ) -> None:
     _set_job(job_id, {"status": "processing", "resume_after": None})
-    tracker = DiffTracker()
     opts = ProcessOptions(
         target_language=target_language,
         treat_biblical_texto_as_google=treat_biblical_texto_as_google,
     )
-    try:
-        total_units = estimate_progress_units(data, opts)
-        def should_cancel() -> bool:
-            with _jobs_lock:
-                job = _jobs.get(job_id)
-                return bool(job and job.get("cancel_requested"))
 
+    def should_cancel() -> bool:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            return bool(job and job.get("cancel_requested"))
+
+    try:
+        # Persist the pristine source so the job can be resumed after a crash or
+        # restart. Skip if it already exists (we are resuming such a job now).
+        if not _job_source_path(job_id).exists():
+            _save_source(job_id, data)
+
+        total_units = estimate_progress_units(data, opts)
+        _save_meta(
+            job_id,
+            {
+                "filename": filename,
+                "target_language": target_language,
+                "treat_biblical_texto_as_google": treat_biblical_texto_as_google,
+                "total_units": total_units,
+                "created_at": _jobs.get(job_id, {}).get("created_at", _now_iso()),
+            },
+        )
         _set_job(
             job_id,
             {
@@ -298,67 +350,68 @@ def _run_review_job(
             },
         )
 
-        completed_units = 0
-        last_pushed = 0
-
-        def on_progress(event: str, path: str | None) -> None:
-            nonlocal completed_units, last_pushed
-            if event in ("chunk", "title_gen", "memo_hit"):
-                completed_units += 1
-            if path is None:
-                return
-            # Throttle frequent updates for massive documents.
-            if (
-                completed_units == total_units
-                or completed_units - last_pushed >= 8
-                or event in ("title_gen",)
-            ):
-                last_pushed = completed_units
-                pct = round((100.0 * min(completed_units, total_units)) / max(total_units, 1), 3)
-                _set_job(
-                    job_id,
-                    {
-                        "completed_units": min(completed_units, total_units),
-                        "progress_pct": pct,
-                        "current_path": path,
-                        "changes_live_count": len(tracker.changes),
-                        "recent_changes": _serialize_recent_changes(tracker),
-                    },
-                )
-
-        can_resume_by_livro = (
-            isinstance(data, dict) and isinstance(data.get("livros"), list)
-        )
-        if can_resume_by_livro:
-            # Mutate `data` in place. The original deep copy here plus another
-            # deep copy per book added significant overhead (and memory churn)
-            # for large multi-megabyte documents without any safety benefit:
-            # `data` is owned exclusively by this background task.
-            root = data
-            livros = root["livros"]
-            ctx = ProcessContext(
-                reviewed_text_cache={},
-                generated_title_cache={},
+        durable = _DurableCache(_job_cache_path(job_id))
+        if durable.hits_on_load:
+            logger.info(
+                "job %s resuming with %d unit(s) already cached on disk",
+                job_id,
+                durable.hits_on_load,
             )
-            cp = _load_checkpoint(job_id)
-            next_idx = 0
-            if cp:
-                next_idx = int(cp.get("next_livro_index", 0))
-                saved = cp.get("partial_result")
-                if isinstance(saved, dict) and isinstance(saved.get("livros"), list):
-                    root = saved
-                    livros = root["livros"]
-            end_idx = len(livros)
-            while next_idx < end_idx:
-                if should_cancel():
-                    raise ProcessingCancelledError("Processing cancelled by user")
-                # `wrapped` reuses the same livro object; processing happens
-                # in place so the result is reflected in `livros[next_idx]`
-                # without any copy.
-                wrapped = {"livros": [livros[next_idx]]}
+        ctx = ProcessContext(durable_get=durable.get, durable_put=durable.put)
+
+        attempt = 0
+        tracker = DiffTracker()
+        try:
+            while True:
+                # Each attempt walks the whole (pristine) document. Anything done
+                # in a prior attempt is served from the durable cache, so this is
+                # cheap; only un-finished units actually hit the API.
+                tracker = DiffTracker()
+                ctx.reviewed_text_cache = {}
+                ctx.generated_title_cache = {}
+                state = {"completed": 0, "last_pushed": 0}
+
+                def on_progress(event: str, path: str | None) -> None:
+                    if event == "paused":
+                        _set_job(
+                            job_id,
+                            {
+                                "status": "paused_daily_limit",
+                                "resume_after": path,
+                                "error": None,
+                            },
+                        )
+                        return
+                    if event == "resumed":
+                        _set_job(job_id, {"status": "processing", "resume_after": None})
+                    if event in ("chunk", "title_gen", "memo_hit"):
+                        state["completed"] += 1
+                    completed = state["completed"]
+                    if path is None and event != "resumed":
+                        return
+                    if (
+                        completed == total_units
+                        or completed - state["last_pushed"] >= 8
+                        or event in ("title_gen", "resumed")
+                    ):
+                        state["last_pushed"] = completed
+                        pct = round(
+                            (100.0 * min(completed, total_units)) / max(total_units, 1), 3
+                        )
+                        _set_job(
+                            job_id,
+                            {
+                                "completed_units": min(completed, total_units),
+                                "progress_pct": pct,
+                                "current_path": path,
+                                "changes_live_count": len(tracker.changes),
+                                "recent_changes": _serialize_recent_changes(tracker),
+                            },
+                        )
+
                 try:
-                    process_json_document(
-                        wrapped,
+                    result = process_json_document(
+                        data,
                         opts,
                         tracker,
                         progress=on_progress,
@@ -366,83 +419,33 @@ def _run_review_job(
                         should_cancel=should_cancel,
                         in_place=True,
                     )
-                except Exception as e:
-                    _save_checkpoint(
-                        job_id,
-                        {
-                            "next_livro_index": next_idx,
-                            "partial_result": root,
-                            "filename": filename,
-                            "target_language": target_language,
-                            "treat_biblical_texto_as_google": treat_biblical_texto_as_google,
-                            "total_units": total_units,
-                            "completed_units": min(completed_units, total_units),
-                            "progress_pct": round(
-                                (100.0 * min(completed_units, total_units))
-                                / max(total_units, 1),
-                                3,
-                            ),
-                            "changes_live_count": len(tracker.changes),
-                            "created_at": _jobs.get(job_id, {}).get("created_at", _now_iso()),
-                            "error": str(e),
-                            "updated_at": _now_iso(),
-                        },
-                    )
-                    if _is_daily_rate_limit_error(e):
-                        _set_job(
-                            job_id,
-                            {
-                                "status": "paused_daily_limit",
-                                "error": str(e),
-                                "resume_after": _next_utc_midnight_iso(),
-                            },
-                        )
-                        cancelled = _wait_until_next_utc_midnight_or_cancel(should_cancel)
-                        if cancelled:
-                            raise ProcessingCancelledError("Processing cancelled by user")
-                        _set_job(
-                            job_id,
-                            {
-                                "status": "processing",
-                                "error": None,
-                                "resume_after": None,
-                            },
-                        )
-                        continue
+                    break
+                except ProcessingCancelledError:
                     raise
-                # `livros[next_idx]` was mutated in place by process_json_document.
-                next_idx += 1
-                _save_checkpoint(
-                    job_id,
-                    {
-                        "next_livro_index": next_idx,
-                        "partial_result": root,
-                        "filename": filename,
-                        "target_language": target_language,
-                        "treat_biblical_texto_as_google": treat_biblical_texto_as_google,
-                        "total_units": total_units,
-                        "completed_units": min(completed_units, total_units),
-                        "progress_pct": round(
-                            (100.0 * min(completed_units, total_units)) / max(total_units, 1),
-                            3,
-                        ),
-                        "changes_live_count": len(tracker.changes),
-                        "created_at": _jobs.get(job_id, {}).get("created_at", _now_iso()),
-                        "updated_at": _now_iso(),
-                    },
-                )
-            result = root
-        else:
-            result = process_json_document(
-                data,
-                opts,
-                tracker,
-                progress=on_progress,
-                should_cancel=should_cancel,
-                in_place=True,
-            )
+                except (ValueError, AuthenticationError, PermissionDeniedError):
+                    # Configuration / credential problems: retrying cannot help.
+                    raise
+                except Exception:
+                    attempt += 1
+                    if attempt >= _JOB_MAX_RESTARTS:
+                        raise
+                    logger.exception(
+                        "review job %s attempt %d failed; reloading source and retrying",
+                        job_id,
+                        attempt,
+                    )
+                    # Reload a pristine copy: the previous attempt mutated `data`
+                    # in place, and re-walking that would re-send corrected text.
+                    data = json.loads(_job_source_path(job_id).read_text(encoding="utf-8"))
+                    _set_job(job_id, {"status": "processing", "error": None})
+                    time.sleep(min(2 ** attempt, 30))
+                    continue
+        finally:
+            durable.close()
+
         if should_cancel():
             raise ProcessingCancelledError("Processing cancelled by user")
+
         payload = {
             "result": result,
             "changes": tracker.to_json(),
@@ -450,10 +453,7 @@ def _run_review_job(
             "filename": filename,
         }
         out_path = _job_result_path(job_id)
-        out_path.write_text(
-            json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         _set_job(
             job_id,
             {
@@ -469,25 +469,17 @@ def _run_review_job(
                 "resume_after": None,
             },
         )
-        _clear_checkpoint(job_id)
+        _cleanup_job_files(job_id)
     except ProcessingCancelledError as e:
         _set_job(
             job_id,
-            {
-                "status": "cancelled",
-                "error": str(e),
-                "current_path": None,
-            },
+            {"status": "cancelled", "error": str(e), "current_path": None},
         )
+        _cleanup_job_files(job_id)
     except Exception as e:
         logger.exception("async review job failed")
-        _set_job(
-            job_id,
-            {
-                "status": "failed",
-                "error": str(e),
-            },
-        )
+        _set_job(job_id, {"status": "failed", "error": str(e)})
+        _cleanup_job_files(job_id)
 
 
 def _get_job_or_404(job_id: str) -> dict[str, Any]:
